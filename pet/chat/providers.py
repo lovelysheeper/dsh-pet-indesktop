@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, threading, urllib.error, urllib.request
+import json, ssl, threading, urllib.error, urllib.request
 from collections.abc import Iterator
 from typing import Any
 from .models import ProviderConfig
@@ -39,6 +39,21 @@ class SSEParser:
                 if content: out.append(str(content))
         return out
 
+def _make_ssl_context(verify_ssl: bool) -> ssl.SSLContext:
+    """Build the TLS context used for the provider request.
+
+    verify_ssl=True  -> default strict verification (server cert must be valid).
+    verify_ssl=False -> skip certificate/hostname verification, used to trust a
+                        self-signed certificate (e.g. a local proxy doing MITM,
+                        like iKuuu VPN on 127.0.0.1:12001, or a self-hosted relay).
+    """
+    if verify_ssl:
+        return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
 class OpenAICompatibleProvider:
     def stream(self,messages:list[dict[str,str]],config:ProviderConfig,cancel_event:threading.Event)->Iterator[str]:
         endpoint=normalize_chat_endpoint(config.base_url,config.chat_path)
@@ -46,7 +61,8 @@ class OpenAICompatibleProvider:
         headers={'Content-Type':'application/json','Accept':'text/event-stream'}
         if config.api_key: headers['Authorization']=f'Bearer {config.api_key}'
         req=urllib.request.Request(endpoint,data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=headers,method='POST')
-        try: response=urllib.request.urlopen(req,timeout=config.timeout)
+        context=_make_ssl_context(bool(getattr(config,'verify_ssl',True)))
+        try: response=urllib.request.urlopen(req,timeout=config.timeout,context=context)
         except urllib.error.HTTPError as exc:
             detail=exc.read(2048).decode('utf-8','replace'); raise ProviderError(_safe_error_detail(detail),exc.code) from exc
         except urllib.error.URLError as exc: raise ProviderError(f'网络连接失败：{exc.reason}') from exc
