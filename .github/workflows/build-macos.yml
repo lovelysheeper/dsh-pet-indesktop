@@ -27,9 +27,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install PySide6 imageio-ffmpeg pillow pyinstaller pytest keyring
 
-      - name: Generate GIF assets from webm
-        run: python scripts/convert_to_gif.py
-
       - name: Generate app icon (.icns)
         run: python scripts/make_icon.py --icns
 
@@ -38,71 +35,55 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
 
-      # 四个变体与 Windows 发布一致：
-      #   webm-chat / webm（无 Chat）  / gif-chat / gif（无 Chat）
-      # onedir 形态：运行期零解压、不产生临时缓存；build_variant.py 注入
-      # 变体标识，配置目录/自启项按变体隔离（与 Windows 行为一致）。
-      - name: Build onedir .app variants
+      # 只构建 webm-chat 一个变体（WebM 素材 + AI 对话）。
+      # 不再生成 GIF 素材，也不再构建 webm / gif-chat / gif 变体，
+      # 避免把 ~800MB GIF 素材打进产物，导致体积暴涨到 ~1.7GB。
+      - name: Build webm-chat onedir .app
         run: |
-          for SPEC in \
-            "webm-chat|packaging/pet_entry.py|assets/characters|" \
-            "webm|packaging/pet_entry_no_chat.py|assets/characters|--exclude-module pet.chat --exclude-module keyring" \
-            "gif-chat|packaging/pet_entry.py|assets/characters_gif|" \
-            "gif|packaging/pet_entry_no_chat.py|assets/characters_gif|--exclude-module pet.chat --exclude-module keyring"; do
-            IFS='|' read -r VARIANT ENTRY DATAS EXCLUDES <<< "$SPEC"
-            echo "==> building $VARIANT"
-            echo "VARIANT = '$VARIANT'" > packaging/build_variant.py
-            python -m PyInstaller --noconfirm --clean --onedir --windowed \
-              --paths . \
-              --collect-all imageio_ffmpeg \
-              --name "dsh-pet-standalone-$VARIANT" \
-              --icon assets/icon.icns \
-              --add-data "$DATAS:$DATAS" \
-              $EXCLUDES \
-              "$ENTRY"
-            if [ $? -ne 0 ]; then echo "::error::$VARIANT 构建失败"; exit 1; fi
-          done
+          VARIANT="webm-chat"
+          echo "VARIANT = '$VARIANT'" > packaging/build_variant.py
+          python -m PyInstaller --noconfirm --clean --onedir --windowed \
+            --paths . \
+            --collect-all imageio_ffmpeg \
+            --name "dsh-pet-standalone-$VARIANT" \
+            --icon assets/icon.icns \
+            --add-data "assets/characters:assets/characters" \
+            packaging/pet_entry.py
+          if [ $? -ne 0 ]; then echo "::error::$VARIANT 构建失败"; exit 1; fi
 
       - name: Verify pet module collected
         run: |
-          for VARIANT in webm-chat webm gif-chat gif; do
-            APP="dsh-pet-standalone-$VARIANT"
-            WARN="build/$APP/warn-$APP.txt"
-            if [ -f "$WARN" ] && grep -q "missing module named pet" "$WARN"; then
-              echo "::error::$APP pet 模块未被 PyInstaller 收集"; cat "$WARN"; exit 1
-            fi
-            echo "$APP pet 模块已收集"
-          done
+          APP="dsh-pet-standalone-webm-chat"
+          WARN="build/$APP/warn-$APP.txt"
+          if [ -f "$WARN" ] && grep -q "missing module named pet" "$WARN"; then
+            echo "::error::$APP pet 模块未被 PyInstaller 收集"; cat "$WARN"; exit 1
+          fi
+          echo "$APP pet 模块已收集"
 
       - name: Ad-hoc codesign
         run: |
-          for VARIANT in webm-chat webm gif-chat gif; do
-            codesign --force --deep --sign - "dist/dsh-pet-standalone-$VARIANT.app"
-          done
+          codesign --force --deep --sign - "dist/dsh-pet-standalone-webm-chat.app"
 
       - name: Package as zip
         run: |
           cd dist
-          for VARIANT in webm-chat webm gif-chat gif; do
-            ditto -c -k --keepParent "dsh-pet-standalone-$VARIANT.app" \
-              "dsh-pet-standalone-$VARIANT-macos-arm64.zip"
-          done
+          ditto -c -k --keepParent "dsh-pet-standalone-webm-chat.app" \
+            "dsh-pet-standalone-webm-chat-macos-arm64.zip"
 
       - name: Verify zip preserves executable permission
         run: |
-          for ZIP in dist/dsh-pet-standalone-*-macos-arm64.zip; do
-            rm -rf /tmp/verify && mkdir -p /tmp/verify
-            cd /tmp/verify
-            unzip -q "$GITHUB_WORKSPACE/$ZIP"
-            APP="${ZIP##*/}"; APP="${APP%-macos-arm64.zip}.app"
-            BIN="$APP/Contents/MacOS/${APP%.app}"
-            ls -l "$BIN"
-            if [ ! -x "$BIN" ]; then
-              echo "::error::$ZIP 解压后二进制丢失可执行权限"; exit 1
-            fi
-            echo "$ZIP 可执行权限保留"
-            cd "$GITHUB_WORKSPACE"
-          done
+          ZIP="dist/dsh-pet-standalone-webm-chat-macos-arm64.zip"
+          rm -rf /tmp/verify && mkdir -p /tmp/verify
+          cd /tmp/verify
+          unzip -q "$GITHUB_WORKSPACE/$ZIP"
+          APP="dsh-pet-standalone-webm-chat.app"
+          BIN="$APP/Contents/MacOS/${APP%.app}"
+          ls -l "$BIN"
+          if [ ! -x "$BIN" ]; then
+            echo "::error::$ZIP 解压后二进制丢失可执行权限"; exit 1
+          fi
+          echo "$ZIP 可执行权限保留"
+          cd "$GITHUB_WORKSPACE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
