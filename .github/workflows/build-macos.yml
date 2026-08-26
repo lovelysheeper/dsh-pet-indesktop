@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6 imageio-ffmpeg pillow pyinstaller pytest keyring
+          pip install PySide6 imageio-ffmpeg pillow pyinstaller pytest keyring certifi
 
       - name: Generate app icon (.icns)
         run: python scripts/make_icon.py --icns
@@ -45,6 +45,10 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onedir --windowed \
             --paths . \
             --collect-all imageio_ffmpeg \
+            --collect-all certifi \
+            --add-data "assets/sounds:assets/sounds" \
+            --add-data "assets/chat:assets/chat" \
+            --add-data "pet/chat/styles.qss:pet/chat" \
             --name "dsh-pet-standalone-$VARIANT" \
             --icon assets/icon.icns \
             --add-data "assets/characters:assets/characters" \

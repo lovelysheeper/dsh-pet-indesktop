@@ -9,13 +9,16 @@ def utc_now(): return datetime.now(timezone.utc).isoformat()
 @dataclass
 class ProviderConfig:
     provider_id: str
-    name: str='OpenAI Compatible'; base_url: str='https://api.openai.com'; chat_path: str='/v1/chat/completions'; model: str='gpt-4o-mini'; api_key_ref: str=''; api_key: str=''; timeout: float=60.0; temperature: float=0.7; max_tokens: int=2048; verify_ssl: bool=True
+    name: str='OpenAI Compatible'; base_url: str='https://api.openai.com'; chat_path: str='/v1/chat/completions'; model: str='gpt-4o-mini'; api_key_ref: str=''; api_key: str=''; timeout: float=60.0; temperature: float=0.7; max_tokens: int=2048; vision_model: str=''; vision_same_as_chat: bool=True; vision_base_url: str=''; vision_api_key_ref: str=''; vision_api_key: str=''; verify_ssl: bool=True
     @classmethod
     def from_dict(cls,pid,raw):
-        return cls(str(pid),str(raw.get('name',pid)),str(raw.get('base_url','https://api.openai.com')),str(raw.get('chat_path','/v1/chat/completions')),str(raw.get('model','gpt-4o-mini')),str(raw.get('api_key_ref',f'provider/{pid}')),str(raw.get('api_key','')),max(1.,float(raw.get('timeout',60))),max(0.,min(2.,float(raw.get('temperature',.7)))),max(1,int(raw.get('max_tokens',2048))),bool(raw.get('verify_ssl',True)))
+        c = cls(str(pid), str(raw.get('name', pid)), str(raw.get('base_url', 'https://api.openai.com')), str(raw.get('chat_path', '/v1/chat/completions')), str(raw.get('model', 'gpt-4o-mini')), str(raw.get('api_key_ref', f'provider/{pid}')), str(raw.get('api_key', '')), max(1., float(raw.get('timeout', 60))), max(0., min(2., float(raw.get('temperature', .7)))), max(1, int(raw.get('max_tokens', 2048))), verify_ssl=bool(raw.get('verify_ssl', True)))
+        c.vision_model=str(raw.get('vision_model','')); c.vision_same_as_chat=bool(raw.get('vision_same_as_chat',True))
+        c.vision_base_url=str(raw.get('vision_base_url','')); c.vision_api_key_ref=str(raw.get('vision_api_key_ref','')); c.vision_api_key=str(raw.get('vision_api_key',''))
+        return c
     def to_dict(self,include_secret=True):
         d=asdict(self); d.pop('provider_id',None)
-        if not include_secret: d.pop('api_key',None)
+        if not include_secret: d.pop('api_key',None); d.pop('vision_api_key',None)
         return d
 
 @dataclass
@@ -44,12 +47,12 @@ class ChatMessage:
 
 @dataclass
 class ChatSession:
-    session_id: str; character_id: str; provider_id: str; system_prompt: str; messages: list[ChatMessage]=field(default_factory=list); created_at: str=field(default_factory=utc_now); updated_at: str=field(default_factory=utc_now)
+    session_id: str; character_id: str; provider_id: str; system_prompt: str; messages: list[ChatMessage]=field(default_factory=list); created_at: str=field(default_factory=utc_now); updated_at: str=field(default_factory=utc_now); title: str=''
     @classmethod
     def create(cls,character_id,provider_id,system_prompt): return cls(uuid.uuid4().hex,character_id,provider_id,system_prompt)
-    def to_dict(self): return {'session_id':self.session_id,'character_id':self.character_id,'provider_id':self.provider_id,'system_prompt':self.system_prompt,'created_at':self.created_at,'updated_at':self.updated_at,'messages':[m.to_dict() for m in self.messages]}
+    def to_dict(self): return {'session_id':self.session_id,'character_id':self.character_id,'provider_id':self.provider_id,'system_prompt':self.system_prompt,'created_at':self.created_at,'updated_at':self.updated_at,'title':self.title,'messages':[m.to_dict() for m in self.messages]}
     @classmethod
-    def from_dict(cls,raw): return cls(str(raw['session_id']),str(raw['character_id']),str(raw.get('provider_id','')),str(raw.get('system_prompt','')),[ChatMessage.from_dict(x) for x in raw.get('messages',[]) if isinstance(x,dict)],str(raw.get('created_at',utc_now())),str(raw.get('updated_at',utc_now())))
+    def from_dict(cls,raw): return cls(str(raw['session_id']),str(raw['character_id']),str(raw.get('provider_id','')),str(raw.get('system_prompt','')),[ChatMessage.from_dict(x) for x in raw.get('messages',[]) if isinstance(x,dict)],str(raw.get('created_at',utc_now())),str(raw.get('updated_at',utc_now())),str(raw.get('title','')))
 
 class SecretStore:
     def __init__(self,service_name='dsh-pet-standalone'):

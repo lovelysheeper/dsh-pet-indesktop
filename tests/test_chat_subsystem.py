@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import ssl
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,8 @@ from pet.chat.prompt import PromptBuilder, load_character_prompt
 from pet.chat.providers import (
     ProviderError,
     SSEParser,
+    _is_cert_verify_error,
+    _make_ssl_context,
     normalize_chat_endpoint,
 )
 from pet.chat.session_store import SessionStore
@@ -173,7 +178,7 @@ def test_session_popup_uses_readable_dark_text_on_light_surface(tmp_path: Path):
     popup = window.session_combo.view()
     assert popup.objectName() == "session-list"
     assert "QAbstractItemView#session-list" in window.styleSheet()
-    assert "selection-color: #1f2937" in window.styleSheet()
+    assert "selection-color: #3a4552" in window.styleSheet()
     window.close()
 
 
@@ -279,6 +284,43 @@ def test_ai_settings_is_modeless_so_pet_can_still_move(tmp_path: Path):
     assert owner.chat_settings_dialog is None
 
 
+def test_present_dialog_defers_until_popup_menu_closes(tmp_path: Path, monkeypatch):
+    """菜单跟踪会话期间触发的设置弹窗应延迟到菜单关闭后再显示。
+
+    回归 macOS 右键菜单首次点击「AI 设置/桌宠设置」无反应的问题：
+    原生 NSMenu 跟踪会话中新建窗口的 show/activate 会被 AppKit 抑制。
+    """
+    import time
+
+    import pet.app as app_mod
+    from PySide6.QtWidgets import QApplication, QDialog
+    from pet.app import PetApp
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    owner = PetApp(app, Config(tmp_path))
+    state = {"popup": True}
+
+    class FakeQApp:
+        @staticmethod
+        def activePopupWidget():
+            return object() if state["popup"] else None
+
+    monkeypatch.setattr(app_mod, "QApplication", FakeQApp)
+    dialog = QDialog()
+    owner._present_dialog(dialog)
+    app.processEvents()
+    assert not dialog.isVisible(), "菜单仍打开时不应立即显示窗口"
+    state["popup"] = False
+    deadline = time.time() + 3
+    while not dialog.isVisible() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    assert dialog.isVisible(), "菜单关闭后窗口应自动显示"
+    dialog.close()
+    app.processEvents()
+
+
 def test_chat_window_session_switch_and_character_refresh(tmp_path: Path):
     from PySide6.QtWidgets import QApplication
     from pet.config import Config
@@ -303,7 +345,8 @@ def test_chat_window_session_switch_and_character_refresh(tmp_path: Path):
 
 def test_squash_geometry_uses_logical_frame_size_at_high_dpi():
     # DPR=2 的 QPixmap 物理尺寸不能直接拿来当 QWidget 逻辑绘制尺寸。
-    # Q 弹中间帧应与 DPR 无关，并保持脚底在窗口底线。
+    # Q 弹中间帧应与 DPR 无关，并保持脚底在窗口底线；
+    # 宽度不放大（sx=1.0），避免角色伸出窗口/mask 边界被裁剪成透明边缘。
     logical = _squash_geometry(
         window_width=640,
         window_height=390,
@@ -318,9 +361,80 @@ def test_squash_geometry_uses_logical_frame_size_at_high_dpi():
         frame_height=720,
         progress=0.5,
     )
-    assert logical == (-32, 84, 704, 306)
+    assert logical == (0, 84, 640, 306)
     assert physical_mistake != logical
     assert logical[1] + logical[3] == 390
+    # 中间帧宽度不应超过窗口宽度（无宽度膨胀）
+    assert logical[2] == 640
+
+
+def test_placeholder_pixmap_generated():
+    """解码失败降级用的占位帧应非空且尺寸正确（None 防御的兜底画面）。"""
+    from PySide6.QtWidgets import QApplication
+    from pet.window import _make_placeholder_pixmap
+
+    app = QApplication.instance() or QApplication([])
+    pm = _make_placeholder_pixmap("shenshen", 1.0)
+    assert pm.isNull() is False
+    assert pm.width() == 640
+    assert pm.height() == 360
+    small = _make_placeholder_pixmap("", 0.5)
+    assert small.isNull() is False
+    assert small.width() == 320
+
+
+def test_look_sync_appends_to_current_session(tmp_path: Path):
+    """「看看屏幕」结果应写入 AI 对话当前会话（UI + 持久化）。"""
+    from PySide6.QtWidgets import QApplication
+    from pet.chat.widgets import ChatWindow
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    window = ChatWindow(Config(tmp_path), "shenshen")
+    before = len(window.session.messages)
+    window.append_look_sync("[看看屏幕] 前台窗口：chrome.exe | 哔哩哔哩", "主人又在看视频啦~")
+    assert len(window.session.messages) == before + 2
+    assert window.session.messages[-2].role == "user"
+    assert window.session.messages[-2].content.startswith("[看看屏幕]")
+    assert window.session.messages[-1].role == "assistant"
+    assert window.session.messages[-1].content == "主人又在看视频啦~"
+    # 持久化：重新加载会话能看到
+    reloaded = window.store.load(window.session.session_id, "shenshen")
+    assert reloaded is not None
+    assert reloaded.messages[-1].content == "主人又在看视频啦~"
+    # 空参数应被忽略
+    before = len(window.session.messages)
+    window.append_look_sync("", "")
+    assert len(window.session.messages) == before
+    window.close()
+    app.processEvents()
+
+
+def test_check_ffmpeg_detects_missing_binary(monkeypatch):
+    """ffmpeg 二进制缺失（被杀软隔离）时启动自检应返回 False。"""
+    import imageio_ffmpeg
+
+    from pet import app as app_mod
+
+    monkeypatch.setattr(
+        imageio_ffmpeg,
+        "get_ffmpeg_exe",
+        lambda: str(Path("E:/definitely/not/exist/ffmpeg.exe")),
+    )
+    assert app_mod._check_ffmpeg_available() is False
+
+
+def test_check_ffmpeg_accepts_existing_binary(monkeypatch):
+    import imageio_ffmpeg
+
+    from pet import app as app_mod
+
+    monkeypatch.setattr(
+        imageio_ffmpeg,
+        "get_ffmpeg_exe",
+        lambda: str(Path(__file__).resolve()),
+    )
+    assert app_mod._check_ffmpeg_available() is True
 
 
 def test_follow_pet_option_registers_and_unregisters_position_listener(tmp_path: Path):
@@ -395,7 +509,7 @@ def test_no_chat_packaging_uses_isolated_entrypoint():
         assert "pet_entry_no_chat.py" not in chat_spec
 
 
-def test_chat_window_uses_opaque_shell_and_message_surface(tmp_path: Path):
+def test_chat_window_uses_translucent_shell_for_rounded_corners(tmp_path: Path):
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
     from pet.chat.widgets import ChatWindow
@@ -403,9 +517,9 @@ def test_chat_window_uses_opaque_shell_and_message_surface(tmp_path: Path):
 
     app = QApplication.instance() or QApplication([])
     window = ChatWindow(Config(tmp_path), "shenshen")
-    assert window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) is False
+    assert window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) is True
     assert "QDialog#chat-window" in window.styleSheet()
-    assert "background: #f7f4ee" in window.styleSheet()
+    assert "background: #fbf3e9" in window.styleSheet()
     assert window.phone_shell.autoFillBackground() is True
     window.close()
     app.processEvents()
@@ -511,9 +625,36 @@ def test_webm_playback_speed_updates_timer_before_and_after_start():
     clip.set_playback_speed(0.5)
     assert clip._timer.interval() >= 80
 
+
+def test_warm_first_frame_caches_qimage_for_zero_block_jump():
+    """后台预热只缓存 QImage；jumpToFrame(0) 走缓存时主线程零阻塞转 QPixmap。
+
+    回归：点击 Q 弹残留上一动画帧——首次播放某动画时 jumpToFrame(0)
+    同步 ffmpeg 解码导致 _current_pixmap 短暂为 None，窗口层 rebuild
+    拿不到新帧而继续画旧帧。
+    """
+    from PySide6.QtWidgets import QApplication
+    from pet.webm_clip import WebMClip
+
+    if not WebMClip.available:
+        pytest.skip("imageio-ffmpeg 不可用")
+    app = QApplication.instance() or QApplication([])
+    clip = WebMClip(Path("assets/characters/shenshen/videos/idle/待机呼吸休闲.webm"))
+    assert clip._first_image is None
+    clip.warm_first_frame()
+    assert clip._first_image is not None, "后台预热应缓存首帧 QImage"
+    assert clip._first_pixmap is None, "后台预热不应触碰 QPixmap（非主线程）"
+    clip.jumpToFrame(0)
+    assert clip._current_pixmap is not None, "jumpToFrame(0) 应基于缓存立即生成 QPixmap"
+    assert not clip._current_pixmap.isNull()
+
 def test_webm_and_gif_animation_sets_are_in_sync():
     webm_root = Path("assets/characters")
     gif_root = Path("assets/characters_gif")
+    # gif 镜像资产可选（不入库）；缺目录时跳过，不阻塞 CI
+    if not gif_root.is_dir():
+        import pytest
+        pytest.skip("gif 镜像目录 assets/characters_gif 不存在（可选资产）")
     webm_rel = {
         path.relative_to(webm_root).with_suffix(".gif")
         for path in webm_root.rglob("*.webm")
@@ -553,3 +694,229 @@ def test_config_shared_dir_when_no_variant_marker(tmp_path):
 
     cfg = config_mod.Config(tmp_path)
     assert cfg.dir == tmp_path / "dsh-pet-standalone"
+
+
+def test_chat_window_builtin_background_resolves(tmp_path: Path):
+    from PySide6.QtWidgets import QApplication
+    from pet.chat.widgets import ChatWindow
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    cfg = Config(tmp_path)
+    cfg.set("chat_background", "builtin:whale")
+    window = ChatWindow(cfg, "shenshen")
+    assert window._bg_pixmap is not None and not window._bg_pixmap.isNull()
+    assert "rgba(255, 250, 242" in window.styleSheet()  # 半透明面板叠加层生效
+    window.close()
+
+
+def test_chat_window_no_background_by_default(tmp_path: Path):
+    from PySide6.QtWidgets import QApplication
+    from pet.chat.widgets import ChatWindow
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    window = ChatWindow(Config(tmp_path), "shenshen")
+    assert window._bg_pixmap is None
+    window.close()
+
+
+def test_chat_background_config_roundtrip(tmp_path: Path):
+    """chat_background 必须能穿过 config 的加载白名单存取往返。"""
+    from pet.config import Config
+
+    cfg = Config(tmp_path)
+    cfg.set("chat_background", "builtin:whale")
+    cfg.save()
+    assert Config(tmp_path).get("chat_background") == "builtin:whale"
+
+def test_provider_config_verify_ssl_roundtrip():
+    p = ProviderConfig("t", verify_ssl=False)
+    assert p.to_dict()["verify_ssl"] is False
+    p2 = ProviderConfig.from_dict("t", p.to_dict())
+    assert p2.verify_ssl is False
+    # 旧配置没有该字段时默认开启校验
+    p3 = ProviderConfig.from_dict("t", {"name": "old"})
+    assert p3.verify_ssl is True
+
+
+def test_ssl_context_selection():
+    assert _make_ssl_context(False).verify_mode == ssl.CERT_NONE
+    assert _make_ssl_context(True).verify_mode == ssl.CERT_REQUIRED
+
+
+def test_cert_error_detection():
+    assert _is_cert_verify_error(
+        ssl.SSLError("certificate verify failed: self-signed certificate in certificate chain")
+    ) is True
+    assert _is_cert_verify_error(TimeoutError("timed out")) is False
+
+
+def test_connection_test_happy_path(tmp_path):
+    import http.server
+
+    from pet.chat.providers import OpenAICompatibleProvider, test_connection
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            if '"stream": true' in body.decode("utf-8", "replace"):
+                out = b'data: {"choices":[{"delta":{"content":"pong"}}]}\n\ndata: [DONE]\n\n'
+            else:
+                out = json.dumps({"choices": [{"message": {"content": "pong"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        cfg = ProviderConfig("t", base_url=f"http://127.0.0.1:{port}", model="x")
+        ok, msg = test_connection(cfg)
+        assert ok is True
+        assert "200" in msg
+        # 同一配置走 stream 也应成功
+        provider = OpenAICompatibleProvider()
+        chunks = list(provider.stream([{"role": "user", "content": "hi"}], cfg, threading.Event()))
+        assert "".join(chunks) == "pong"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_stream_surfaces_certificate_hint(monkeypatch):
+    from pet.chat.providers import OpenAICompatibleProvider
+
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.URLError(
+            ssl.SSLError("certificate verify failed: self-signed certificate in certificate chain")
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider()
+    with pytest.raises(ProviderError) as excinfo:
+        list(provider.stream([{"role": "user", "content": "hi"}], ProviderConfig("t"), threading.Event()))
+    assert "网络连接失败" in str(excinfo.value)
+    assert "跳过 SSL 证书验证" in str(excinfo.value)
+
+
+def test_connection_test_reports_certificate_hint(monkeypatch):
+    from pet.chat.providers import test_connection
+
+    def fake_urlopen(*args, **kwargs):
+        raise urllib.error.URLError(
+            ssl.SSLError("certificate verify failed: self-signed certificate in certificate chain")
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    ok, msg = test_connection(ProviderConfig("t"))
+    assert ok is False
+    assert "跳过 SSL 证书验证" in msg
+
+
+def test_win_topmost_helpers_safe_with_invalid_hwnd():
+    """无效句柄下 Win32 置顶辅助函数应安全返回 False（不崩溃）。"""
+    from pet.window import _win_is_topmost, _win_set_topmost
+
+    assert _win_is_topmost(0) is False
+    assert _win_set_topmost(0, True) is False
+
+
+def test_enforce_topmost_resets_lost_topmost(monkeypatch, tmp_path):
+    """置顶丢失时 watchdog 应调用原生 SetWindowPos 重设。"""
+    import types
+
+    from pet import window as window_mod
+    from pet.config import Config
+
+    monkeypatch.setattr("sys.platform", "win32")
+    calls = []
+    monkeypatch.setattr(window_mod, "_win_is_topmost", lambda hwnd: False)
+    monkeypatch.setattr(window_mod, "_win_set_topmost", lambda hwnd, on: calls.append((hwnd, on)) or True)
+    cfg = Config(tmp_path)
+    fake = types.SimpleNamespace(cfg=cfg, winId=lambda: 12345,
+                                 isVisible=lambda: True, _auto_hidden=False)
+    window_mod.PetWindow._enforce_topmost(fake)
+    assert calls == [(12345, True)]
+
+
+def test_enforce_topmost_skips_when_on_top_disabled(monkeypatch, tmp_path):
+    """关闭置顶时 watchdog 不应重设。"""
+    import types
+
+    from pet import window as window_mod
+    from pet.config import Config
+
+    monkeypatch.setattr("sys.platform", "win32")
+    calls = []
+    monkeypatch.setattr(window_mod, "_win_is_topmost", lambda hwnd: False)
+    monkeypatch.setattr(window_mod, "_win_set_topmost", lambda hwnd, on: calls.append((hwnd, on)) or True)
+    cfg = Config(tmp_path)
+    cfg.set("on_top", False)
+    fake = types.SimpleNamespace(cfg=cfg, winId=lambda: 12345,
+                                 isVisible=lambda: True, _auto_hidden=False)
+    window_mod.PetWindow._enforce_topmost(fake)
+    assert calls == []
+
+
+def test_connection_test_reentrant_clicks_do_not_duplicate_requests(tmp_path, monkeypatch):
+    """多次点击测试连接：进行中重复调用被忽略，完成后可再次发起；不产生线程崩溃。"""
+    import time
+
+    import pet.chat.settings_dialog as sd
+    from PySide6.QtWidgets import QApplication
+    from pet.chat.settings_dialog import ChatSettingsDialog
+    from pet.config import Config
+
+    app = QApplication.instance() or QApplication([])
+    dialog = ChatSettingsDialog(Config(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_test(cfg, timeout=10.0):
+        calls.append(1)
+        started.set()
+        release.wait(10)
+        return True, "连接成功（HTTP 200）"
+
+    monkeypatch.setattr(sd, "test_connection", fake_test)
+    try:
+        dialog._run_test()
+        assert started.wait(2), "第一次测试未启动"
+        dialog._run_test()
+        dialog._run_test()
+        release.set()
+        deadline = time.time() + 5
+        while dialog._test_thread is not None and dialog._test_thread.is_alive() and time.time() < deadline:
+            time.sleep(0.05)
+        assert len(calls) == 1, f"进行中重复点击不应发起新请求，实际 {len(calls)} 次"
+        app.processEvents()
+        assert dialog.test.isEnabled()
+        assert dialog.test.text() == "测试连接"
+        # 第二轮：全新阻塞事件，验证"完成后可再次发起 + 进行中重复点击仍被忽略"。
+        # 注意必须换新 release：上一轮的 release 已 set，旧事件会让新线程瞬间完成，
+        # 使 is_alive() 为 False 而误启动第三个线程（macOS 上时序更快，必然触发）。
+        release = threading.Event()
+        dialog._run_test()
+        assert started.wait(2), "第二轮测试未启动"
+        dialog._run_test()
+        dialog._run_test()
+        release.set()
+        deadline = time.time() + 5
+        while dialog._test_thread is not None and dialog._test_thread.is_alive() and time.time() < deadline:
+            time.sleep(0.05)
+        assert len(calls) == 2, f"第二轮进行中重复点击不应发起新请求，实际 {len(calls)} 次"
+        app.processEvents()
+    finally:
+        release.set()
+        dialog.close()
+        app.processEvents()

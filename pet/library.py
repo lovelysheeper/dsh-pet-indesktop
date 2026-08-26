@@ -128,8 +128,20 @@ class MovieLibrary(QObject):
         self.folder_files: dict[str, list[str]] = {}
         self._movies: dict[str, object] = {}
         self.media_type: str = 'webm'
+        self.no_mirror: set[str] = self._load_no_mirror()
 
         self._load_all()
+
+    def _load_no_mirror(self) -> set[str]:
+        '''加载 text_clips.json：内含文字的动画在朝向翻转时不镜像（防文字反显）。'''
+        import json
+        path = self._asset_dir / 'text_clips.json'
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return set()
+        names = data.get('no_mirror', [])
+        return {str(n) for n in names} if isinstance(names, list) else set()
 
     def _load_all(self) -> None:
         if self._manifest is None:
@@ -186,9 +198,17 @@ class MovieLibrary(QObject):
 
     def _warm_all_meta_background(self) -> None:
         try:
-            workers = min(8, len(self._movies))
+            # 并发控制在 3：每个 webm 首帧预热都会拉起一个 ffmpeg 子进程，
+            # 并发过高会形成进程洪峰，提高杀毒软件拦截/误报概率。
+            workers = min(3, len(self._movies))
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(lambda clip: clip.warm_meta(), list(self._movies.values())))
+                # 预解码各动画首帧（QImage 线程安全），首次播放时零阻塞切换，
+                # 避免点击 Q 弹瞬间同步 ffmpeg 解码造成卡顿与旧动画帧残留。
+                list(ex.map(
+                    lambda clip: getattr(clip, 'warm_first_frame', lambda: None)(),
+                    list(self._movies.values()),
+                ))
         except Exception:
             # 预热失败不致命，后续按需读取时会再尝试
             pass
